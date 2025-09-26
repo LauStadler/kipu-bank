@@ -1,5 +1,5 @@
 # kipu-bank
-KipuBank
+
 Descripción
 
 KipuBank es un contrato inteligente en Solidity que simula un banco simple para almacenar y gestionar ETH de múltiples usuarios. Cada usuario tiene una “bóveda personal” dentro del contrato.
@@ -68,3 +68,8 @@ Permite al usuario ver su saldo en el contrato.
 
 4. Consideraciones sobre transferencias directas
 Si alguien envía ETH directamente al contrato (sin llamar a deposit()), el contrato lo acepta mediante la función receive(), pero y se registra automáticamente en el balance del usuario.
+
+
+Link y dirección a mi contrato 
+Address 0x91233Ca013E035641fC60dC9fA1093818D4aa362
+[Address: 0x91233ca0...18d4aa362 | Etherscan](https://sepolia.etherscan.io/address/0x91233ca013e035641fc60dc9fa1093818d4aa362)

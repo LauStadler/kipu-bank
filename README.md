@@ -1,5 +1,99 @@
 # kipu-bank
+KipuBank version 2
 
+KipuBank es un contrato inteligente en Solidity que simula un banco simple para almacenar y gestionar ETH y tokens ERC20 de múltiples usuarios. Cada usuario tiene una “bóveda personal” dentro del contrato, y el deployer inicial se convierte en administrador (ADMIN_ROLE) del banco.
+
+Características principales:
+
+Control de acceso basado en roles:
+
+ADMIN_ROLE: Puede agregar o eliminar usuarios, habilitar/deshabilitar tokens y cambiar límites de retiro.
+
+USER_ROLE: Puede depositar y retirar fondos.
+
+Los usuarios pueden depositar ETH en su bóveda personal, respetando el límite máximo por usuario (bankCap).
+Los usuarios pueden retirar ETH hasta un límite por transacción (withdrawLimit) y siempre según su saldo disponible.
+Soporte multi-token ERC20: los usuarios pueden depositar y retirar tokens aprobados por el admin.
+Los depósitos y retiros de ETH y tokens se registran mediante eventos (Deposit, Withdraw, DepositToken, WithdrawToken).
+Todos los depósitos (incluyendo transfers directas a receive() o fallback()) se redirigen a la misma lógica central, manteniendo consistencia contable.
+Función de oráculo Chainlink integrada para obtener el precio actual de ETH en USD.
+Validaciones de límites implementadas con modificadores y errores personalizados (InvalidDeposit, InvalidWithdrawal) para eficiencia y claridad.
+
+Instrucciones de despliegue
+
+Usando Remix IDE
+
+Preparar el contrato
+Abrir Remix IDE.
+Crear un archivo KipuBank.sol y pegar el contrato completo.
+Seleccionar Solidity Compiler → Version 0.8.20 (o superior compatible).
+Presionar Compile.
+Desplegar el contrato
+Ir a Deploy & Run Transactions.
+Seleccionar Environment (por ejemplo: Injected Web3 para usar MetaMask).
+Ingresar los parámetros:
+bankCap: límite máximo de depósito por usuario (en wei).
+withdrawLimit: límite máximo de retiro por operación (en wei).
+priceFeed: dirección del oráculo Chainlink ETH/USD.
+Presionar Deploy.
+Remix mostrará la dirección del contrato y las funciones disponibles.
+Usando Etherscan (testnet o mainnet)
+Verificar el contrato
+Copiar la dirección del contrato desplegado.
+Ir a Etherscan de la red correspondiente (por ejemplo, Sepolia).
+Buscar el contrato por dirección.
+Haz Verify & Publish: pegar el código fuente, seleccionar compilador 0.8.20 y licencia MIT.
+
+Interactuar con el contrato
+
+En la pestaña Contract → Write Contract, conectar MetaMask.
+
+Funciones disponibles:
+
+deposit() payable: envía ETH al contrato.
+withdraw(uint256 _amount): retira ETH.
+depositToken(address token, uint256 amount): deposita un token ERC20 soportado.
+withdrawToken(address token, uint256 amount): retira un token ERC20.
+
+Para leer balances y datos:
+bankBalance(address user) → saldo en ETH.
+tokenBalances(address user, address token) → saldo de un token ERC20.
+getLatestETHPrice() → precio de ETH en USD desde Chainlink.
+
+Cómo interactuar con el contrato
+Depositar ETH
+Función: deposit() payable
+El usuario envía ETH al contrato usando esta función o mediante transferencia directa (receive/fallback).
+Se verifica que no supere bankCap y se actualiza el balance interno.
+Evento: Deposit(address user, uint256 amount)
+Retirar ETH
+Función: withdraw(uint256 _amount)
+El usuario puede retirar hasta su balance disponible y respetando withdrawLimit.
+Evento: Withdraw(address user, uint256 amount)
+Depositar Tokens ERC20
+Función: depositToken(address token, uint256 amount)
+Solo se pueden depositar tokens habilitados por el admin (supportedTokens[token] = true).
+El usuario debe aprobar previamente el token al contrato usando IERC20(token).approve(...).
+Evento: DepositToken(address user, address token, uint256 amount)
+Retirar Tokens ERC20
+Función: withdrawToken(address token, uint256 amount)
+Se retira hasta el saldo disponible del usuario para ese token.
+Evento: WithdrawToken(address user, address token, uint256 amount)
+Consultar saldo
+ETH: bankBalance(address user)
+Tokens: tokenBalances(address user, address token)
+Gestión de roles (solo ADMIN_ROLE)
+addUser(address user) → asigna rol de usuario.
+removeUser(address user) → revoca rol de usuario.
+setTokenSupport(address token, bool supported) → habilita/deshabilita tokens.
+updateWithdrawLimit(uint256 newLimit) → ajusta límite de retiro por operación.
+Consideraciones sobre transferencias directas
+
+Si alguien envía ETH directamente al contrato (sin llamar a deposit()), se registra automáticamente en el balance del usuario mediante receive() o fallback().
+
+Esto mantiene consistencia contable, pero se siguen aplicando las validaciones de bankCap.
+
+KipuBank version 1
 Descripción
 
 KipuBank es un contrato inteligente en Solidity que simula un banco simple para almacenar y gestionar ETH de múltiples usuarios. Cada usuario tiene una “bóveda personal” dentro del contrato.

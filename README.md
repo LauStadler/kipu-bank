@@ -151,6 +151,8 @@ Si alguien envía ETH directamente al contrato (sin llamar a deposit()), se regi
 
 Esto mantiene consistencia contable, pero se siguen aplicando las validaciones de bankCap.
 
+Address del contrato 0x51eCaC5A8C2681fC88113D15F7fe0ed4720d8E1d https://sepolia.etherscan.io/address/0x51ecac5a8c2681fc88113d15f7fe0ed4720d8e1d#code
+
 KipuBank version 1
 Descripción
 

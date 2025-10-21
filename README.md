@@ -76,13 +76,19 @@ En la pestaña Contract → Write Contract, conectar MetaMask.
 Funciones disponibles:
 
 deposit() payable: envía ETH al contrato.
+
 withdraw(uint256 _amount): retira ETH.
+
 depositToken(address token, uint256 amount): deposita un token ERC20 soportado.
+
 withdrawToken(address token, uint256 amount): retira un token ERC20.
 
 Para leer balances y datos:
+
 bankBalance(address user) → saldo en ETH.
+
 tokenBalances(address user, address token) → saldo de un token ERC20.
+
 getLatestETHPrice() → precio de ETH en USD desde Chainlink.
 
 Cómo interactuar con el contrato

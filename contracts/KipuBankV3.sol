@@ -5,289 +5,340 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import {IUniswapV2Factory} from "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
 import {IUniswapV2Pair} from "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
 
+interface IWETH {
+    function deposit() external payable;
+    function withdraw(uint256) external;
+    function approve(address, uint256) external returns (bool);
+    function transfer(address to, uint256 value) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
 /**
  * @title KipuBank
- * @notice Banco descentralizado que permite depósitos en cualquier token soportado y los convierte automáticamente a USDC.
- * @dev Los fondos se contabilizan en USDC usando Uniswap V2. Mantiene límites globales y oráculo Chainlink para referencia de precios ETH/USD.
+ * @notice Banco descentralizado que permite depósitos en cualquier token soportado, convirtiéndolos automáticamente a USDC
+ *         mediante swaps Uniswap V2. Los fondos quedan contabilizados internamente en USDC.
+ * @dev Incluye:
+ *      - Roles basados en AccessControl
+ *      - Límite máximo de TVL en USDC
+ *      - Retiros con límite dinámico
+ *      - Swaps directos con Uniswap V2 Pair
+ *      - Soporte para ETH mediante WETH
+ *      - Feed de precios Chainlink solo para estimaciones previas
  */
 contract KipuBank is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    // ---------- Roles ----------
+    // -----------------------------------------------------------------------
+    //                                 ROLES
+    // -----------------------------------------------------------------------
+
+    /// @notice Rol de administrador del sistema (puede agregar usuarios, cambiar límites, etc.)
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    /// @notice Rol asignado a usuarios habilitados (actualmente solo administrado, no restrictivo para depositar)
     bytes32 public constant USER_ROLE = keccak256("USER_ROLE");
 
-    // ---------- Variables ----------
+    // -----------------------------------------------------------------------
+    //                             VARIABLES
+    // -----------------------------------------------------------------------
+
+    /// @notice Capacidad máxima total del banco expresada en USDC (6 decimales)
     uint256 public immutable bankCap;
+
+    /// @notice Suma total de fondos depositados (siempre expresados en USDC normalizado)
     uint256 public totalDepositedNormalized;
+
+    /// @notice Límite máximo que un usuario puede retirar en una sola operación
     uint256 public withdrawLimit;
 
+    /// @notice Balance interno de cada usuario expresado únicamente en USDC
     mapping(address => uint256) public usdcBalances;
 
+    /// @notice Oráculo Chainlink ETH/USD para estimaciones previas
     AggregatorV3Interface internal priceFeed;
+
+    /// @notice Dirección del factory de Uniswap V2 usado para obtener pares
     IUniswapV2Factory public immutable FACTORY;
+
+    /// @notice Dirección del token USDC usado como unidad de cuenta del banco
     address public immutable usdc;
 
-    // ---------- Eventos ----------
+    /// @notice Dirección del contrato WETH necesario para manejar depósitos en ETH
+    address public immutable weth;
+
+    // -----------------------------------------------------------------------
+    //                               EVENTOS
+    // -----------------------------------------------------------------------
+
+    /**
+     * @notice Emitted when a user performs a deposit
+     * @param user Usuario que deposita
+     * @param tokenIn Token depositado (address(0) si es ETH)
+     * @param amountIn Cantidad de token depositado
+     * @param usdcReceived USDC obtenido luego del swap
+     */
     event Deposit(address indexed user, address indexed tokenIn, uint256 amountIn, uint256 usdcReceived);
+
+    /// @notice Emitido cuando un usuario retira USDC
     event Withdraw(address indexed user, uint256 usdcAmount);
+
+    /// @notice Emitido cuando un usuario retira en ETH (si existiera un flujo así)
     event WithdrawAsETH(address indexed user, uint256 usdcSpent, uint256 ethOut);
+
+    /// @notice Emitido cuando el límite de retiro es modificado por admins
     event WithdrawLimitUpdated(uint256 newLimit);
-     event SwapModule_SwapExecuted(
+
+    /**
+     * @notice Emitido tras la ejecución de un swap Uniswap V2
+     * @param user Usuario que originó la transacción
+     * @param tokenIn Token ingresado al swap
+     * @param tokenOut Token recibido
+     * @param amountIn Cantidad entregada al swap
+     * @param amountOut Cantidad recibida del swap
+     */
+    event SwapModule_SwapExecuted(
         address indexed user,
         address indexed tokenIn,
         address indexed tokenOut,
         uint256 amountIn,
         uint256 amountOut
     );
-   
-    //------------Errores------------
+
+    // -----------------------------------------------------------------------
+    //                                ERRORES
+    // -----------------------------------------------------------------------
+
+    /// @notice Error lanzado cuando la salida del swap es inferior al mínimo permitido por slippage
     error SwapModule_InsufficientOutputAmount();
+
+    /// @notice Error lanzado si la liquidez del par es insuficiente o nula
     error SwapModule_InsufficientLiquidity();
+
+    /// @notice Error lanzado si el par no existe en Uniswap V2
     error SwapModule_PairDoesNotExist();
+
+    /// @notice Error por direcciones inválidas o coincidentes
     error SwapModule_InvalidAddress();
+
+    /// @notice Error por montos de entrada inválidos (ej: amountIn = 0)
     error SwapModule_InvalidAmount();
 
-    // ---------- Constructor ----------
+    // -----------------------------------------------------------------------
+    //                              CONSTRUCTOR
+    // -----------------------------------------------------------------------
+
     /**
-     * @param _bankCap Límite máximo global de depósitos (en unidades de USDC).
-     * @param _withdrawLimit Límite máximo de retiro por transacción.
-     * @param _priceFeed Dirección del oráculo Chainlink ETH/USD.
-     * @param _usdc Dirección del token USDC.
+     * @notice Inicializa el contrato configurando límites, direcciones externas, oráculo, factory,
+     *         token USDC y dirección WETH.
+     * @param _bankCap Capacidad total del banco en USDC (6 decimales)
+     * @param _withdrawLimit Límite inicial de retiro
+     * @param _priceFeed Dirección del oráculo Chainlink ETH/USD
+     * @param _usdc Dirección del token USDC
+     * @param _factory Dirección del Uniswap Factory
+     * @param _weth Dirección del contrato WETH
      */
     constructor(
         uint256 _bankCap,
         uint256 _withdrawLimit,
         address _priceFeed,
         address _usdc,
-        address _factory
+        address _factory,
+        address _weth
     ) {
         require(_priceFeed != address(0), "PriceFeed invalido");
         require(_usdc != address(0), "USDC invalido");
+        require(_factory != address(0), "Factory invalido");
+        require(_weth != address(0), "WETH invalido");
 
         bankCap = _bankCap;
         withdrawLimit = _withdrawLimit;
         priceFeed = AggregatorV3Interface(_priceFeed);
         usdc = _usdc;
         FACTORY = IUniswapV2Factory(_factory);
+        weth = _weth;
+
         _grantRole(ADMIN_ROLE, msg.sender);
         _grantRole(USER_ROLE, msg.sender);
     }
 
-    // ---------- Modificadores ----------
+    // -----------------------------------------------------------------------
+    //                              MODIFIERS
+    // -----------------------------------------------------------------------
+
+    /// @notice Restringe funciones a administradores
     modifier onlyAdmin() {
         require(hasRole(ADMIN_ROLE, msg.sender), "Solo admin");
         _;
     }
 
-    modifier onlyUser() {
-        require(hasRole(USER_ROLE, msg.sender), "Solo usuario");
-        _;
-    }
-
-    //---------FUNCIONES-------------
-
-    /// @notice Valida que ambas direcciones no sean cero y sean diferentes
-    /// @param tokenA Primera dirección a validar
-    /// @param tokenB Segunda dirección a validar
+    /**
+     * @notice Verifica que dos direcciones de tokens sean válidas y distintas
+     */
     modifier validTokenAddresses(address tokenA, address tokenB) {
-        if (tokenA == address(0) || tokenB == address(0)) {
-            revert SwapModule_InvalidAddress();
-        }
-        if (tokenA == tokenB) {
-            revert SwapModule_InvalidAddress();
-        }
+        if (tokenA == address(0) || tokenB == address(0)) revert SwapModule_InvalidAddress();
+        if (tokenA == tokenB) revert SwapModule_InvalidAddress();
         _;
     }
 
-    /// @notice Valida que la cantidad sea mayor que cero
-    /// @param amount Cantidad a validar
+    /**
+     * @notice Verifica que el monto sea mayor a cero
+     */
     modifier validAmount(uint256 amount) {
-        if (amount == 0) {
-            revert SwapModule_InvalidAmount();
-        }
+        if (amount == 0) revert SwapModule_InvalidAmount();
         _;
     }
 
-    /// @notice Valida que el par de tokens exista en el factory
-    /// @param tokenA Primer token
-    /// @param tokenB Segundo token
+    /**
+     * @notice Verifica que el par exista en Uniswap
+     */
     modifier pairExists(address tokenA, address tokenB) {
         address pair = FACTORY.getPair(tokenA, tokenB);
-        if (pair == address(0)) {
-            revert SwapModule_PairDoesNotExist();
-        }
+        if (pair == address(0)) revert SwapModule_PairDoesNotExist();
         _;
     }
-    
+
+    // -----------------------------------------------------------------------
+    //                           SWAP UNISWAP V2
+    // -----------------------------------------------------------------------
+
     /**
-     * @notice Función para ejecutar swaps de inputs exactos en Uniswap V2
-     * @notice Los outputs pueden variar según el valor mínimo amountOutMin
-     * @param tokenIn La dirección del token de entrada
-     * @param tokenOut La dirección del token de salida
-     * @param amountIn La cantidad a intercambiar
-     * @param amountOutMin La cantidad mínima aceptada después de un swap
-     * @dev Esta función sigue las mejores prácticas de Uniswap V2
-     * @return amountOut cantidad de tokens recibidos
+     * @notice Realiza un swap unidireccional usando directamente Uniswap V2 Pair,
+     *         aceptando tanto balances del contrato como transferencias del usuario.
+     *
+     * @dev Implementa el modelo constante-product (x*y=k).
+     *      No transfiere el tokenOut al usuario; solo lo retorna al caller.
+     *
+     * @param tokenIn Token entregado
+     * @param tokenOut Token recibido
+     * @param amountIn Monto a intercambiar
+     * @param amountOutMin Mínimo aceptable a recibir
+     * @return amountOut Cantidad real obtenida del swap
      */
-    function swapExactInputSingle(address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin)
+    function swapExactInputSingle(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOutMin
+    )
         internal
         validTokenAddresses(tokenIn, tokenOut)
         validAmount(amountIn)
         pairExists(tokenIn, tokenOut)
         returns (uint256 amountOut)
     {
-        // Obtener el par (ya validado por el modificador pairExists)
         address pair = FACTORY.getPair(tokenIn, tokenOut);
 
-        // 1. Obtener reservas antes del swap (para cálculo)
-        (uint256 reserve0, uint256 reserve1, ) = IUniswapV2Pair(pair)
-            .getReserves();
-
-        // Determinar cuál token es token0 y token1
+        (uint256 reserve0, uint256 reserve1, ) = IUniswapV2Pair(pair).getReserves();
         address token0 = IUniswapV2Pair(pair).token0();
         bool token0IsTokenIn = token0 == tokenIn;
 
-        // 2. Calcular la cantidad de salida esperada
         uint256 amountOutExpected = getAmountOut(
             amountIn,
             token0IsTokenIn ? reserve0 : reserve1,
             token0IsTokenIn ? reserve1 : reserve0
         );
 
-        // Verificar que el cálculo produce al menos el mínimo esperado
-        if (amountOutExpected < amountOutMin) {
-            revert SwapModule_InsufficientOutputAmount();
+        if (amountOutExpected < amountOutMin) revert SwapModule_InsufficientOutputAmount();
+
+        uint256 contractBal = IERC20(tokenIn).balanceOf(address(this));
+
+        if (contractBal >= amountIn) {
+            IERC20(tokenIn).safeTransfer(pair, amountIn);
+        } else {
+            IERC20(tokenIn).safeTransferFrom(msg.sender, pair, amountIn);
         }
 
-        // 3. Transferir tokens del usuario al par usando SafeERC20
-        IERC20(tokenIn).safeTransferFrom(msg.sender, pair, amountIn);
-
-        // 4. Registrar balance antes del swap para verificación
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
 
-        // 5. Realizar el swap en el par
-        uint256 amount0Out;
-        uint256 amount1Out;
-        if (token0IsTokenIn) {
-            amount0Out = 0;
-            amount1Out = amountOutExpected;
-        } else {
-            amount0Out = amountOutExpected;
-            amount1Out = 0;
-        }
+        uint256 amount0Out = token0IsTokenIn ? 0 : amountOutExpected;
+        uint256 amount1Out = token0IsTokenIn ? amountOutExpected : 0;
 
         IUniswapV2Pair(pair).swap(amount0Out, amount1Out, address(this), "");
 
-        // 6. Obtener balance después del swap y calcular amountOut real
         uint256 balanceAfter = IERC20(tokenOut).balanceOf(address(this));
         amountOut = balanceAfter - balanceBefore;
 
-        // 7. Verificar que recibimos al menos el mínimo esperado (seguridad extra)
-        if (amountOut < amountOutMin) {
-            revert SwapModule_InsufficientOutputAmount();
-        }
+        if (amountOut < amountOutMin) revert SwapModule_InsufficientOutputAmount();
 
-        // 8. Transferir tokens de salida al usuario usando SafeERC20
-        IERC20(tokenOut).safeTransfer(msg.sender, amountOut);
-
-        emit SwapModule_SwapExecuted(
-            msg.sender,
-            tokenIn,
-            tokenOut,
-            amountIn,
-            amountOut
-        );
-
-        return amountOut;
+        emit SwapModule_SwapExecuted(msg.sender, tokenIn, tokenOut, amountIn, amountOut);
     }
 
     /**
-     * @notice Función auxiliar para calcular la cantidad de salida
-     * @param amountIn Cantidad de entrada
+     * @notice Calcula el output esperado en un swap según la fórmula de Uniswap x*y=k
+     * @param amountIn Cantidad que entra
      * @param reserveIn Reserva del token de entrada
      * @param reserveOut Reserva del token de salida
-     * @return amountOut Cantidad calculada de salida
-     * @dev Implementa la fórmula AMM de Uniswap V2: amountOut = (amountIn * 997 * reserveOut) / (reserveIn * 1000 + amountIn * 997)
+     * @return amountOut Cantidad resultante estimada
      */
     function getAmountOut(
         uint256 amountIn,
         uint256 reserveIn,
         uint256 reserveOut
     ) public pure returns (uint256 amountOut) {
-        if (amountIn == 0 || reserveIn == 0 || reserveOut == 0) {
-            revert SwapModule_InsufficientLiquidity();
-        }
+        if (amountIn == 0 || reserveIn == 0 || reserveOut == 0) revert SwapModule_InsufficientLiquidity();
 
-        // Uniswap V2 tiene una fee del 0.3% (3/1000)
-        // El input se multiplica por 997 (1000 - 3)
         uint256 amountInWithFee = amountIn * 997;
-
-        // Calcular el denominador y numerador
         uint256 numerator = amountInWithFee * reserveOut;
-        uint256 denominator = (reserveIn * 1000) + amountInWithFee;
+        uint256 denominator = reserveIn * 1000 + amountInWithFee;
 
         amountOut = numerator / denominator;
     }
 
     /**
-     * @notice Función para obtener el par de tokens
-     * @param tokenA Primer token
-     * @param tokenB Segundo token
-     * @return pair Dirección del par
+     * @notice Retorna la dirección del par entre dos tokens
      */
-    function getPair(
-        address tokenA,
-        address tokenB
-    ) external view returns (address pair) {
+    function getPair(address tokenA, address tokenB) external view returns (address pair) {
         return FACTORY.getPair(tokenA, tokenB);
     }
 
- // ---------- Depósitos ----------
+    // -----------------------------------------------------------------------
+    //                               DEPÓSITOS
+    // -----------------------------------------------------------------------
+
     /**
-     * @notice Permite depositar ETH o cualquier token ERC20 soportado. Los fondos se convierten automáticamente a USDC.
-     * @param tokenIn Dirección del token a depositar. Use address(0) para ETH.
-     * @param amountIn Cantidad del token a depositar (se ignora si es ETH, ya que se usa msg.value).
+     * @notice Permite depositar ETH o cualquier token ERC20. El monto depositado se convierte
+     *         automáticamente a USDC mediante Uniswap V2.
+     *
+     * @dev Si tokenIn == address(0), se trata de ETH y se envuelve en WETH antes del swap.
+     * @param tokenIn Token que ingresa (address(0) = ETH)
+     * @param amountIn Cantidad depositada (ignorada si es ETH)
      */
+    function deposit(address tokenIn, uint256 amountIn) public payable nonReentrant {
+        uint256 amount = tokenIn == address(0) ? msg.value : amountIn;
+        require(amount > 0, "Monto invalido");
 
-    function deposit(address tokenIn, uint256 amountIn) 
-    public 
-    payable 
-    onlyUser 
-    nonReentrant 
-{
-    uint256 amount = tokenIn == address(0) ? msg.value : amountIn;
-    require(amount > 0, "Monto invalido");
+        uint256 estimatedUSDC = _getUSDCValue(tokenIn, amount);
+        _checkDepositLimit(estimatedUSDC);
 
-    uint256 estimatedUSDC = _getUSDCValue(tokenIn, amount);
+        uint256 usdcReceived;
 
-    _checkDepositLimit(estimatedUSDC);
+        if (tokenIn == address(0)) {
+            IWETH(weth).deposit{value: amount}();
+            usdcReceived = swapExactInputSingle(weth, usdc, amount, 1);
+        } else {
+            uint256 amountOutMin = (amountIn * 95) / 100;
+            usdcReceived = swapExactInputSingle(tokenIn, usdc, amountIn, amountOutMin);
+        }
 
-    uint256 usdcReceived;
+        _checkDepositLimit(usdcReceived);
 
-    if (tokenIn == address(0)) {
-        usdcReceived = estimatedUSDC;
-    } else {
-        address tokenOut = usdc; 
-        uint256 amountOutMin = (amountIn * 95) / 100;
-        usdcReceived = swapExactInputSingle(tokenIn, tokenOut, amountIn, amountOutMin);
+        usdcBalances[msg.sender] += usdcReceived;
+        totalDepositedNormalized += usdcReceived;
+
+        emit Deposit(msg.sender, tokenIn, amount, usdcReceived);
     }
 
-    usdcBalances[msg.sender] += usdcReceived;
-    totalDepositedNormalized += estimatedUSDC;
+    // -----------------------------------------------------------------------
+    //                                 RETIROS
+    // -----------------------------------------------------------------------
 
-    emit Deposit(msg.sender, tokenIn, amount, usdcReceived);
-}
-
-
-    // ---------- Retiros ----------
     /**
-     * @notice Retira USDC directamente del balance del usuario.
-     * @param amountUSDC Monto de USDC a retirar.
+     * @notice Permite retirar USDC que el usuario haya depositado previamente
+     * @param amountUSDC Cantidad a retirar
      */
     function withdrawUSDC(uint256 amountUSDC) external nonReentrant {
         require(amountUSDC > 0, "Monto invalido");
@@ -302,49 +353,88 @@ contract KipuBank is AccessControl, ReentrancyGuard {
         emit Withdraw(msg.sender, amountUSDC);
     }
 
-    // ---------- Auxiliares ----------
+    // -----------------------------------------------------------------------
+    //                               AUXILIARES
+    // -----------------------------------------------------------------------
+
+    /**
+     * @notice Revisa si un depósito excedería el límite total del banco
+     * @param normalizedAmount Monto en USDC normalizado
+     */
     function _checkDepositLimit(uint256 normalizedAmount) internal view {
         require(totalDepositedNormalized + normalizedAmount <= bankCap, "Excede limite banco");
     }
 
-    /// @notice Devuelve el último precio ETH/USD desde Chainlink.
+    /**
+     * @notice Devuelve el último precio ETH/USD desde Chainlink (8 decimales)
+     * @return price Precio actual
+     */
     function getLatestETHPrice() public view returns (int256 price) {
         (, price,,,) = priceFeed.latestRoundData();
     }
 
     /**
-     * @notice Estima valor de un token en USDC usando Chainlink (solo ETH soportado en esta versión).
+     * @notice Estima el valor equivalente en USDC para un token dado
+     * @dev Solo ETH tiene soporte nativo vía Chainlink
+     * @param token Token a evaluar
+     * @param amount Cantidad del token
+     * @return Valor aproximado en USDC
      */
     function _getUSDCValue(address token, uint256 amount) internal view returns (uint256) {
         if (token == address(0)) {
-            int256 ethPrice = getLatestETHPrice(); // en USD * 1e8
+            int256 ethPrice = getLatestETHPrice();
+            require(ethPrice > 0, "Precio ETH invalido");
             uint256 usdValue = (uint256(ethPrice) * amount) / 1e8;
-            return usdValue / 1e12; // ajustar a 6 decimales (USDC)
+            return usdValue / 1e12;
         }
-        return amount; // para tokens ya en USDC
+
+        if (token == usdc) return amount;
+
+        return amount;
     }
 
-    // ---------- Admin ----------
+    // -----------------------------------------------------------------------
+    //                                ADMIN
+    // -----------------------------------------------------------------------
+
+    /**
+     * @notice Actualiza el límite máximo de retiro permitido para todos
+     * @param newLimit Nuevo límite
+     */
     function updateWithdrawLimit(uint256 newLimit) external onlyAdmin {
         require(newLimit > 0, "Limite invalido");
         withdrawLimit = newLimit;
         emit WithdrawLimitUpdated(newLimit);
     }
 
-    // ---------- Roles ----------
+    /**
+     * @notice Asigna rol USER_ROLE a un usuario
+     */
     function addUser(address user) external onlyAdmin {
         grantRole(USER_ROLE, user);
     }
 
+    /**
+     * @notice Revoca el rol USER_ROLE de un usuario
+     */
     function removeUser(address user) external onlyAdmin {
         revokeRole(USER_ROLE, user);
     }
 
-    // ---------- Fallbacks ----------
+    // -----------------------------------------------------------------------
+    //                              FALLBACKS
+    // -----------------------------------------------------------------------
+
+    /**
+     * @notice Permite depositar enviando ETH directamente al contrato
+     */
     receive() external payable {
         deposit(address(0), msg.value);
     }
 
+    /**
+     * @notice Fallback que también considera ETH como depósito
+     */
     fallback() external payable {
         deposit(address(0), msg.value);
     }

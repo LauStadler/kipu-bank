@@ -1,4 +1,10 @@
 # kipu-bank
+
+KipuBank version 3
+
+En esta version los usuarios podran depositar, al igual que en la anterior, cualquier token a su cuenta. Sin embargo el monto depositado se transformará en USDC, por lo tanto, al momento de extraer fondos estos seran en USDC. Esto fue logrado con el modulo de UniSwapV2. 
+El resto de las funcionalidades implementadas en la version 2 de KipuBank se mantienen al igual que sus instrucciones de despliegue e interacción.
+
 KipuBank version 2
 
 KipuBank es un contrato inteligente en Solidity que simula un banco simple para almacenar y gestionar ETH y tokens ERC20 de múltiples usuarios. Cada usuario tiene una “bóveda personal” dentro del contrato, y el deployer inicial se convierte en administrador (ADMIN_ROLE) del banco.
